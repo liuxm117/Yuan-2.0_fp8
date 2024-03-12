@@ -944,54 +944,96 @@ class ParallelTEAttention(MegatronModule):
                     gather_output=False)
         else:
             assert attention_type == AttnType.cross_attn
-            self.query = tensor_parallel.ColumnParallelLinear(
+            from transformer_engine.pytorch.module import Linear
+            self.get_value = Linear(
                 config.hidden_size,
                 projection_size,
-                config=config,
                 init_method=config.init_method,
                 bias=config.add_bias_linear,
-                gather_output=False)
-
-            self.key_value = tensor_parallel.ColumnParallelLinear(
-                config.hidden_size,
-                2 * projection_size,
-                config=config,
-                init_method=config.init_method,
-                bias=config.add_bias_linear,
-                gather_output=False)
-
-        self.core_attention = CoreAttention(self.layer_number, config,
-                                            self.attn_mask_type)
-        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
-
-        if self.use_flash_attn:
-            self.core_attention_flash = FlashSelfAttention(
-                causal=True, attention_dropout=self.flash_attn_drop
+                parallel_mode='column',
+                fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
+                tp_group=mpu.get_tensor_model_parallel_group(),
+                tp_size=args.tensor_model_parallel_size,
+                get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+                sequence_parallel=config.sequence_parallel,
+                params_dtype=config.params_dtype,
             )
 
+            self.get_query_key = Linear(
+                config.hidden_size,
+                2 * projection_size,
+                init_method=config.init_method,
+                bias=config.add_bias_linear,
+                parallel_mode='column',
+                fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
+                tp_group=mpu.get_tensor_model_parallel_group(),
+                tp_size=args.tensor_model_parallel_size,
+                get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+                sequence_parallel=config.sequence_parallel,
+                params_dtype=config.params_dtype,
+            )
+            # self.query = tensor_parallel.ColumnParallelLinear(
+                # config.hidden_size,
+                # projection_size,
+                # config=config,
+                # init_method=config.init_method,
+                # bias=config.add_bias_linear,
+                # gather_output=False)
+
+            # self.key_value = tensor_parallel.ColumnParallelLinear(
+                # config.hidden_size,
+                # 2 * projection_size,
+                # config=config,
+                # init_method=config.init_method,
+                # bias=config.add_bias_linear,
+                # gather_output=False)
+
+        # self.core_attention = CoreAttention(self.layer_number, config,
+                                            # self.attn_mask_type)
+        self.checkpoint_core_attention = config.recompute_granularity == 'selective'
+
+        # if self.use_flash_attn:
+            # self.core_attention_flash = FlashSelfAttention(
+                # causal=True, attention_dropout=self.flash_attn_drop
+            # )
+
+        from transformer_engine.pytorch.attention import DotProductAttention
+        self.core_attention = DotProductAttention(
+            config.num_attention_heads,
+            config.kv_channels,
+            num_gqa_groups=None,
+            attention_dropout=config.attention_dropout,
+            tp_size=args.tensor_model_parallel_size,
+            get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+            attn_mask_type=self.attn_mask_type.name,
+            sequence_parallel=config.sequence_parallel,
+            tp_group=mpu.get_tensor_model_parallel_group(),
+            layer_number=self.layer_number,
+        )
+
         # Output.
-        # self.dense = Linear(
-        #     projection_size,
-        #     config.hidden_size,
-        #     init_method=config.output_layer_init_method,
-        #     bias=config.add_bias_linear,
-        #     return_bias=True,
-        #     parallel_mode='row',
-        #     fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
-        #     tp_group=mpu.get_tensor_model_parallel_group(),
-        #     tp_size=args.tensor_model_parallel_size,
-        #     get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
-        #     sequence_parallel=config.sequence_parallel,
-        #     params_dtype=config.params_dtype,
-        # )
-        self.dense = tensor_parallel.RowParallelLinear(
+        self.dense = Linear(
             projection_size,
             config.hidden_size,
-            config=config,
             init_method=config.output_layer_init_method,
-            bias=args.add_bias_linear,
-            input_is_parallel=True,
-            skip_bias_add=True)
+            bias=True,
+            return_bias=True,
+            parallel_mode='row',
+            fuse_wgrad_accumulation=config.gradient_accumulation_fusion,
+            tp_group=mpu.get_tensor_model_parallel_group(),
+            tp_size=args.tensor_model_parallel_size,
+            get_rng_state_tracker=tensor_parallel.get_cuda_rng_tracker,
+            sequence_parallel=config.sequence_parallel,
+            params_dtype=config.params_dtype,
+        )
+        # self.dense = tensor_parallel.RowParallelLinear(
+            # projection_size,
+            # config.hidden_size,
+            # config=config,
+            # init_method=config.output_layer_init_method,
+            # bias=args.add_bias_linear,
+            # input_is_parallel=True,
+            # skip_bias_add=True)
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
                                         value_layer, attention_mask,
@@ -1212,23 +1254,26 @@ class ParallelTEAttention(MegatronModule):
             # absolute positional embedding.
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
-
-        if not self.use_flash_attn:
-            if self.checkpoint_core_attention:
-                context_layer = self._checkpointed_attention_forward(
-                    query_layer, key_layer, value_layer, attention_mask)
-            else:
-                context_layer = self.core_attention(
-                    query_layer, key_layer, value_layer, attention_mask)
-        else:
-            q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
-                       for x in (query_layer, key_layer, value_layer)]
-            if not self.sequence_parallel:
-                with tensor_parallel.get_cuda_rng_tracker().fork():
-                    context_layer = self.core_attention_flash(q, k, v)
-            else:
-                context_layer = self.core_attention_flash(q, k, v)
-            context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
+                    
+        context_layer = self.core_attention(
+            query_layer, key_layer, value_layer, attention_mask, checkpoint_core_attention=self.checkpoint_core_attention)
+        
+        # if not self.use_flash_attn:
+            # if self.checkpoint_core_attention:
+                # context_layer = self._checkpointed_attention_forward(
+                    # query_layer, key_layer, value_layer, attention_mask)
+            # else:
+                # context_layer = self.core_attention(
+                    # query_layer, key_layer, value_layer, attention_mask)
+        # else:
+            # q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
+                       # for x in (query_layer, key_layer, value_layer)]
+            # if not self.sequence_parallel:
+                # with tensor_parallel.get_cuda_rng_tracker().fork():
+                    # context_layer = self.core_attention_flash(q, k, v)
+            # else:
+                # context_layer = self.core_attention_flash(q, k, v)
+            # context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
 
         # =================
         # Output. [sq, b, h]
@@ -1762,22 +1807,22 @@ class ParallelTransformerengineLayer(MegatronModule):
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Layernorm on the attention output
-        if args.norm_dtype == "LayerNorm":
-            self.post_attention_layernorm = LayerNorm(
-                config.hidden_size,
-                eps=config.layernorm_epsilon,
-                no_persist_layer_norm=not config.persist_layer_norm,
-                sequence_parallel=config.sequence_parallel,
-                apply_layernorm_1p=args.apply_layernorm_1p)
-        elif args.norm_dtype == "RMSNorm":
-            self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-6)
+        # if args.norm_dtype == "LayerNorm":
+            # self.post_attention_layernorm = LayerNorm(
+                # config.hidden_size,
+                # eps=config.layernorm_epsilon,
+                # no_persist_layer_norm=not config.persist_layer_norm,
+                # sequence_parallel=config.sequence_parallel,
+                # apply_layernorm_1p=args.apply_layernorm_1p)
+        # elif args.norm_dtype == "RMSNorm":
+            # self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=1e-6)
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,
                                LayerType.retro_decoder,
                                LayerType.retro_decoder_with_retriever,
                                LayerType.retro_encoder):
-            self.inter_attention = ParallelAttention(
+            self.inter_attention = ParallelTEAttention(
                 config,
                 layer_number,
                 attention_type=AttnType.cross_attn)
@@ -2106,7 +2151,7 @@ class ParallelTransformerengineLayer(MegatronModule):
             layernorm_input = residual + self.drop_path(out)
 
         # Layer norm post the self attention.
-        layernorm_output = self.post_attention_layernorm(layernorm_input)
+        # layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:
@@ -2142,7 +2187,7 @@ class ParallelTransformerengineLayer(MegatronModule):
                             self.layer_type.name)
 
         # MLP.
-        mlp_output, mlp_bias = self.mlp(layernorm_output)
+        mlp_output, mlp_bias = self.mlp(layernorm_input)
         # Second residual connection.
         if self.apply_residual_connection_post_layernorm:
             residual = layernorm_output
@@ -2532,7 +2577,7 @@ class ParallelTransformer(MegatronModule):
                             tensor_parallel.get_cuda_rng_tracker,
                             mpu.get_tensor_model_parallel_group(),
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, **te_forward_kwargs)
+                            enc_dec_attn_mask)
                     else:
                         hidden_states = tensor_parallel.checkpoint(
                             custom(l, l + 1),
@@ -2544,7 +2589,7 @@ class ParallelTransformer(MegatronModule):
                     if self.transformer_impl == 'transformer_engine':
                         hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, encoder_output,
-                            enc_dec_attn_mask, **te_forward_kwargs)
+                            enc_dec_attn_mask)
                     else:
                         hidden_states = custom(l, l + 1)(
                             hidden_states, attention_mask, enc_position_ids,

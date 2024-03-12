@@ -246,6 +246,9 @@ def convert_checkpoint_from_megatron_to_te(args):
             elif op_name == "mlp.dense_4h_to_h":
                 out_name = ".mlp.fc2_weight"
                 output_state_dict[layer_name + out_name] = params.to(dtype).clone()
+            elif op_name == "post_attention_layernorm":
+                out_name = ".mlp.layer_norm_weight"
+                output_state_dict[layer_name + out_name] = params.to(dtype).clone()
             else:
                 output_state_dict[layer_name + '.' + op_name + '.' + weight_or_bias] = params.to(dtype).clone()
         # print(output_state_dict)
